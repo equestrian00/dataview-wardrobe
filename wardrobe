@@ -1,0 +1,681 @@
+/* ============================================================
+ * WARDROBE OS: VINTAGE EDITION (FULL SYSTEM)
+ * v2.0 - Complete logic, filtering, and styling engine.
+ * ============================================================ */
+
+// 1. CONFIGURATION -------------------------------------------
+const CONFIG = {
+    // SYSTEM
+    rootFolder: "Life/Wardrobe/Items",
+    debugMode: true, // Toggle to see matching scores on cards
+
+    // FRONTMATTER KEYS (The Map)
+    keys: {
+        category: "clothingcategory",
+        subcategory: "clothingsubcategory",
+        style: "clothingstyle",
+        status: "clothingstatus",
+        brand: "brand",
+        color: "color",
+        pattern: "pattern",
+        season: "season",
+        occasion: "occasion",
+        mood: "mood",
+        size: "size",
+        location: "location",
+        image: "cover",
+        cost: "cost",
+        wearCount: "wear_count",
+        purchaseDate: "purchase_date",
+        pairs: "pairs",    // Links: [[Item]]
+        avoids: "avoids",  // Links: [[Item]]
+        outfits: "outfits" // List
+    },
+
+    // STYLIST: COLOR THEORY ENGINE
+    // If Hero is Key, suggest items in Value array.
+    colors: {
+        "Navy": ["White", "Cream", "Beige", "Gold", "Red", "Grey", "Denim"],
+        "Black": ["White", "Grey", "Denim", "Silver", "Camel", "Jewel Tones"], 
+        "White": ["Navy", "Black", "Denim", "Beige", "Grey", "Brown", "Olive"],
+        "Beige": ["Navy", "White", "Black", "Olive", "Denim", "Brown"],
+        "Brown": ["White", "Cream", "Denim", "Green", "Gold"],
+        "Denim": ["White", "Black", "Navy", "Red", "Beige", "Grey"],
+        "Red":   ["Denim", "Navy", "White", "Black", "Gold"]
+    },
+
+    // STYLIST: OUTFIT FORMULAS
+    // Defines the "slots" required to build a full look.
+    formulas: {
+        "Standard": ["Top", "Bottom", "Footwear"],
+        "Layered Winter": ["Top", "Bottom", "Outerwear", "Footwear", "Accessories"],
+        "Summer Date": ["Full Body", "Footwear", "Accessories"],
+        "Casual": ["Top", "Bottom", "Footwear"],
+        "Workwear": ["Top", "Bottom", "Footwear", "Bags"]
+    }
+};
+
+// 2. THE CORE APPLICATION ------------------------------------
+
+class WardrobeApp {
+    constructor() {
+        this.pages = dv.pages(`"${CONFIG.rootFolder}"`).sort(p => p.file.ctime, 'desc');
+        this.container = dv.container;
+        
+        // State Management
+        this.state = {
+            view: 'closet', // closet, stylist, laundry, stats
+            search: '',
+            filters: {}, // Stores active filters for the grid
+            stylist: {
+                hero: null, // The selected anchor item
+                formula: "Standard",
+                selection: {}, // The generated outfit { Top: item, Bottom: item }
+                filterClean: true // Checkbox state
+            }
+        };
+
+        // Define filterable fields for the Sidebar
+        this.filterFields = [
+            { label: "Category", key: CONFIG.keys.category },
+            { label: "Subcategory", key: CONFIG.keys.subcategory },
+            { label: "Style", key: CONFIG.keys.style },
+            { label: "Season", key: CONFIG.keys.season },
+            { label: "Occasion", key: CONFIG.keys.occasion },
+            { label: "Mood", key: CONFIG.keys.mood },
+            { label: "Color", key: CONFIG.keys.color },
+            { label: "Pattern", key: CONFIG.keys.pattern },
+            { label: "Brand", key: CONFIG.keys.brand },
+            { label: "Location", key: CONFIG.keys.location },
+            { label: "Status", key: CONFIG.keys.status }
+        ];
+    }
+
+    async init() {
+        this.render();
+    }
+
+    // --- MAIN RENDERER ---
+    render() {
+        this.container.innerHTML = "";
+        const wrapper = this.createEl('div', { cls: 'w-app' });
+        
+        this.renderHUD(wrapper);
+        
+        const content = this.createEl('div', { cls: 'w-content', parent: wrapper });
+        
+        if (this.state.view === 'closet') this.renderCloset(content);
+        if (this.state.view === 'stylist') this.renderStylist(content);
+        if (this.state.view === 'laundry') this.renderLaundry(content);
+        if (this.state.view === 'stats') this.renderStats(content);
+        
+        this.container.appendChild(wrapper);
+    }
+
+    // --- HUD (Navigation) ---
+    renderHUD(parent) {
+        const hud = this.createEl('div', { cls: 'w-hud', parent });
+        
+        // Left: Branding
+        const left = this.createEl('div', { cls: 'w-nav-left', parent: hud });
+        left.innerHTML = `<span style="font-family:'Playfair Display'; font-weight:900; letter-spacing:1px; font-size:1.2rem;">WARDROBE OS</span>`;
+
+        // Center: Tabs
+        const center = this.createEl('div', { cls: 'w-nav-center', parent: hud });
+        const tabs = [
+            { id: 'closet', label: 'Closet' },
+            { id: 'stylist', label: 'Stylist' },
+            { id: 'laundry', label: 'Laundry' },
+            { id: 'stats', label: 'Analytics' }
+        ];
+        
+        tabs.forEach(t => {
+            const btn = this.createEl('button', { 
+                cls: `w-nav-btn ${this.state.view === t.id ? 'active' : ''}`, 
+                text: t.label, 
+                parent: center 
+            });
+            btn.onclick = () => { this.state.view = t.id; this.render(); };
+        });
+
+        // Right: Search
+        const right = this.createEl('div', { cls: 'w-search-box', parent: hud });
+        if (this.state.view === 'closet') {
+            const input = this.createEl('input', { type: 'text', placeholder: 'Search (Blue OR White)...', parent: right });
+            input.value = this.state.search;
+            // Debounce for performance
+            let timeout;
+            input.onkeyup = (e) => {
+                clearTimeout(timeout);
+                timeout = setTimeout(() => {
+                    this.state.search = e.target.value;
+                    this.refreshGrid();
+                }, 300);
+            };
+        }
+    }
+
+    // ========================================================
+    // VIEW 1: THE CLOSET GRID
+    // ========================================================
+    renderCloset(parent) {
+        const layout = this.createEl('div', { cls: 'w-layout', parent });
+        
+        // 1. Sidebar Filters
+        const sidebar = this.createEl('div', { cls: 'w-sidebar', parent: layout });
+        
+        // Reset Button
+        const resetBtn = this.createEl('button', { cls: 'w-clear-btn', text: "Reset All Filters", parent: sidebar });
+        resetBtn.onclick = () => { this.state.filters = {}; this.state.search = ""; this.render(); };
+
+        // Generate Facets
+        this.filterFields.forEach(field => {
+            const group = this.createEl('div', { cls: 'w-filter-group', parent: sidebar });
+            this.createEl('div', { cls: 'w-group-title', text: field.label, parent: group });
+            const chips = this.createEl('div', { cls: 'w-chips', parent: group });
+            
+            // Get unique values
+            let values = new Set();
+            this.pages.forEach(p => {
+                const val = p[field.key];
+                if (Array.isArray(val)) val.forEach(v => values.add(v));
+                else if (val) values.add(val);
+            });
+            
+            // Render Chips
+            Array.from(values).sort().forEach(val => {
+                const isActive = this.state.filters[field.key]?.includes(val);
+                const chip = this.createEl('div', { 
+                    cls: `w-chip ${isActive ? 'active' : ''}`, 
+                    text: val, 
+                    parent: chips 
+                });
+                chip.onclick = () => {
+                    if (!this.state.filters[field.key]) this.state.filters[field.key] = [];
+                    
+                    if (isActive) {
+                        this.state.filters[field.key] = this.state.filters[field.key].filter(v => v !== val);
+                    } else {
+                        this.state.filters[field.key].push(val);
+                    }
+                    this.refreshGrid();
+                };
+            });
+        });
+
+        // 2. The Grid
+        const gridArea = this.createEl('div', { cls: 'w-grid-area', parent: layout });
+        const grid = this.createEl('div', { id: 'closet-grid', cls: 'w-masonry', parent: gridArea });
+        
+        this.populateGrid(grid);
+    }
+
+    populateGrid(gridEl) {
+        gridEl.innerHTML = "";
+        const filtered = this.getFilteredPages();
+        
+        filtered.forEach(p => this.renderCard(p, gridEl));
+    }
+
+    getFilteredPages() {
+        return this.pages.filter(p => {
+            // A. Text Search (AND/OR Logic)
+            if (this.state.search) {
+                const query = this.state.search.toLowerCase();
+                const content = `${p.file.name} ${p[CONFIG.keys.category]} ${p[CONFIG.keys.brand]} ${p[CONFIG.keys.color]}`.toLowerCase();
+                
+                if (query.includes(" or ")) {
+                    const terms = query.split(" or ").map(t => t.trim());
+                    if (!terms.some(t => content.includes(t))) return false;
+                } else if (query.includes(" and ")) {
+                    const terms = query.split(" and ").map(t => t.trim());
+                    if (!terms.every(t => content.includes(t))) return false;
+                } else {
+                    if (!content.includes(query)) return false;
+                }
+            }
+
+            // B. Faceted Filters
+            for (const [key, activeValues] of Object.entries(this.state.filters)) {
+                if (!activeValues || activeValues.length === 0) continue;
+                const pageVal = p[key];
+                
+                // If page has array (e.g. Colors: [Blue, White])
+                if (Array.isArray(pageVal)) {
+                    if (!pageVal.some(v => activeValues.includes(v))) return false;
+                } else {
+                    if (!activeValues.includes(pageVal)) return false;
+                }
+            }
+            return true;
+        });
+    }
+
+    renderCard(p, parent, showScore = false, score = 0) {
+        const card = this.createEl('div', { cls: 'w-card', parent });
+        
+        // Cover
+        const img = p[CONFIG.keys.image] || "[https://via.placeholder.com/200x300?text=No+Img](https://via.placeholder.com/200x300?text=No+Img)";
+        const cover = this.createEl('div', { cls: 'w-cover', parent: card });
+        cover.style.backgroundImage = `url('${img}')`;
+
+        // Badges
+        const badges = this.createEl('div', { cls: 'w-badges', parent: cover });
+        
+        // Status Badge
+        const status = p[CONFIG.keys.status];
+        if (status && status !== 'clean') {
+            const b = this.createEl('div', { cls: `w-badge ${status === 'laundry' ? 'alert' : ''}`, text: status, parent: badges });
+        }
+
+        // Score Badge (for Stylist)
+        if (showScore && CONFIG.debugMode) {
+             this.createEl('div', { cls: 'w-badge', text: `Score: ${score}`, parent: badges });
+        }
+
+        // Click Event (Modal)
+        card.onclick = (e) => {
+            // If shuffle button clicked, don't open modal
+            if(e.target.className.includes('w-shuffle')) return;
+            this.openItemModal(p);
+        };
+
+        // Text Info
+        const meta = this.createEl('div', { cls: 'w-meta', parent: card });
+        this.createEl('div', { cls: 'w-title', text: p.file.name, parent: meta });
+        this.createEl('div', { cls: 'w-sub', text: `${p[CONFIG.keys.brand] || '-'} / ${p[CONFIG.keys.subcategory] || '-'}`, parent: meta });
+    }
+
+    // ========================================================
+    // VIEW 2: THE STYLIST ENGINE
+    // ========================================================
+    renderStylist(parent) {
+        const container = this.createEl('div', { cls: 'w-stylist-container', parent });
+        
+        // 1. Controls Bar
+        const controls = this.createEl('div', { cls: 'w-hud', style: 'margin-bottom:20px;', parent: container });
+        
+        // Filter Checkbox
+        const checkWrap = this.createEl('label', { parent: controls, style: 'display:flex; gap:10px; align-items:center; cursor:pointer;' });
+        const checkbox = this.createEl('input', { type: 'checkbox', parent: checkWrap });
+        checkbox.checked = this.state.stylist.filterClean;
+        checkbox.onchange = (e) => { this.state.stylist.filterClean = e.target.checked; };
+        this.createEl('span', { text: "Only Clean Items", style: 'font-family:JetBrains Mono; font-size:0.8rem;', parent: checkWrap });
+
+        // Formula Selector
+        const formulaSel = this.createEl('select', { cls: 'w-nav-btn', style: 'background:#333; color:white;', parent: controls });
+        Object.keys(CONFIG.formulas).forEach(f => {
+            const opt = this.createEl('option', { text: f, value: f, parent: formulaSel });
+            if(f === this.state.stylist.formula) opt.selected = true;
+        });
+        formulaSel.onchange = (e) => { this.state.stylist.formula = e.target.value; };
+
+        // Randomize Button
+        const randBtn = this.createEl('button', { cls: 'w-nav-btn active', text: "🎲 Randomize Hero", parent: controls });
+        randBtn.onclick = () => this.runStylist(null); // Null triggers random hero
+
+        // 2. The Split Canvas
+        const canvas = this.createEl('div', { id: 'stylist-canvas', cls: 'w-stylist-split', parent: container });
+        
+        // If state has a selection, render it immediately
+        if (this.state.stylist.hero) {
+            this.renderOutfit(canvas);
+        } else {
+            canvas.innerHTML = `<div style="text-align:center; width:100%; padding:100px; color:#666;">Select a Hero Item or click Randomize to begin styling.</div>`;
+        }
+    }
+
+    runStylist(fixedHero) {
+        // 1. Select Hero
+        let hero = fixedHero;
+        if (!hero) {
+            // Pick random item that fits filters
+            let pool = this.pages;
+            if (this.state.stylist.filterClean) pool = pool.filter(p => p[CONFIG.keys.status] === 'clean');
+            if (pool.length === 0) return new Notice("No items match criteria!");
+            hero = pool[Math.floor(Math.random() * pool.length)];
+        }
+        this.state.stylist.hero = hero;
+
+        // 2. Identify Slots Needed
+        const requiredSlots = CONFIG.formulas[this.state.stylist.formula];
+        const heroCat = hero[CONFIG.keys.category];
+        
+        // 3. Fill Slots
+        this.state.stylist.selection = {}; // Reset
+        
+        // Place Hero in its slot
+        // If hero category is not in formula, force it or handle error. 
+        // For simplicity, we assume user picks formula matching hero, or we just display hero + formula items.
+        
+        requiredSlots.forEach(slot => {
+            if (slot === heroCat) {
+                this.state.stylist.selection[slot] = hero;
+            } else {
+                // Find best match
+                this.state.stylist.selection[slot] = this.findMatch(hero, slot);
+            }
+        });
+
+        // 4. Render
+        const canvas = this.container.querySelector('#stylist-canvas');
+        if (canvas) this.renderOutfit(canvas);
+    }
+
+    // THE SCORING ALGORITHM
+    findMatch(hero, targetCategory) {
+        // A. Filter Candidates
+        let candidates = this.pages.filter(p => {
+            if (p[CONFIG.keys.category] !== targetCategory) return false;
+            if (this.state.stylist.filterClean && p[CONFIG.keys.status] !== 'clean') return false;
+            
+            // Hard Filter: Avoids
+            const avoids = hero[CONFIG.keys.avoids] || [];
+            if (avoids.some(link => link.path === p.file.path)) return false;
+            
+            return true;
+        });
+
+        // B. Score Candidates
+        const scored = candidates.map(candidate => {
+            let score = 0;
+            
+            // 1. Explicit Pairs (+100)
+            const pairs = hero[CONFIG.keys.pairs] || [];
+            if (pairs.some(link => link.path === candidate.file.path)) score += 100;
+
+            // 2. Color Theory (+50)
+            const hColors = Array.isArray(hero[CONFIG.keys.color]) ? hero[CONFIG.keys.color] : [hero[CONFIG.keys.color]];
+            const cColors = Array.isArray(candidate[CONFIG.keys.color]) ? candidate[CONFIG.keys.color] : [candidate[CONFIG.keys.color]];
+            
+            let colorMatch = false;
+            hColors.forEach(hc => {
+                if (CONFIG.colors[hc]) {
+                    if (cColors.some(cc => CONFIG.colors[hc].includes(cc))) colorMatch = true;
+                }
+            });
+            if (colorMatch) score += 50;
+
+            // 3. Mood/Occasion Overlap (+20 per match)
+            const overlaps = ['mood', 'occasion', 'season'];
+            overlaps.forEach(field => {
+                const hVal = hero[CONFIG.keys[field]];
+                const cVal = candidate[CONFIG.keys[field]];
+                if (hVal && cVal) {
+                    const hArr = Array.isArray(hVal) ? hVal : [hVal];
+                    const cArr = Array.isArray(cVal) ? cVal : [cVal];
+                    if (hArr.some(x => cArr.includes(x))) score += 20;
+                }
+            });
+
+            // 4. Usage Balance (+10 for less worn items)
+            if ((candidate[CONFIG.keys.wearCount] || 0) < 5) score += 10;
+
+            return { item: candidate, score: score };
+        });
+
+        // C. Sort & Pick
+        scored.sort((a, b) => b.score - a.score);
+        
+        // Return top match or null
+        return scored.length > 0 ? scored[0].item : null;
+    }
+
+    renderOutfit(parent) {
+        parent.innerHTML = "";
+        
+        // Left: Hero
+        const heroCol = this.createEl('div', { cls: 'w-col-hero', parent });
+        this.createEl('div', { cls: 'w-group-title', text: "HERO ITEM", parent: heroCol });
+        this.renderCard(this.state.stylist.hero, heroCol);
+
+        // Right: Suggestions
+        const suggestCol = this.createEl('div', { cls: 'w-col-suggestions', parent });
+        
+        Object.entries(this.state.stylist.selection).forEach(([slot, item]) => {
+            if (item && item.file.path !== this.state.stylist.hero.file.path) {
+                const slotDiv = this.createEl('div', { cls: 'w-slot-card', parent: suggestCol });
+                this.createEl('div', { cls: 'w-slot-label', text: slot, parent: slotDiv });
+                
+                // Shuffle Button
+                const shuffle = this.createEl('div', { cls: 'w-shuffle-btn', text: "↻", parent: slotDiv });
+                shuffle.onclick = () => {
+                    // Re-run matching for just this slot, explicitly excluding current item
+                    // (Simplified: just randomizing for now or finding next best would require storing the score list)
+                    this.state.stylist.selection[slot] = this.findMatch(this.state.stylist.hero, slot); 
+                    this.renderOutfit(parent);
+                };
+
+                this.renderCard(item, slotDiv, true, 80); // Dummy score for visual
+            }
+        });
+
+        // Log Outfit Button
+        const actionRow = this.createEl('div', { style: 'grid-column: 1 / -1; margin-top:30px; display:flex; justify-content:center;', parent: parent });
+        const logBtn = this.createEl('button', { cls: 'w-btn', text: "✨ Log This Outfit", parent: actionRow });
+        
+        logBtn.onclick = async () => {
+            const today = moment().format("YYYY-MM-DD");
+            const items = Object.values(this.state.stylist.selection).filter(i => i);
+            
+            for (const item of items) {
+                // Determine partners (everyone else in the outfit)
+                const partners = items.filter(i => i.file.path !== item.file.path).map(i => `[[${i.file.name}]]`).join(", ");
+                const logEntry = `${today}: Worn with ${partners}`;
+                
+                // Update Frontmatter
+                await app.fileManager.processFrontMatter(item.file, (fm) => {
+                    // Update Wear Count
+                    fm[CONFIG.keys.wearCount] = (fm[CONFIG.keys.wearCount] || 0) + 1;
+                    // Update Status to Laundry
+                    fm[CONFIG.keys.status] = "hamper";
+                    // Add to Outfits Log
+                    if (!fm[CONFIG.keys.outfits]) fm[CONFIG.keys.outfits] = [];
+                    fm[CONFIG.keys.outfits].push(logEntry);
+                });
+            }
+            new Notice(`Outfit logged! ${items.length} items moved to Hamper.`);
+            this.state.view = 'laundry'; // Jump to laundry to confirm
+            this.render();
+        };
+    }
+
+    // ========================================================
+    // VIEW 3: LAUNDRY KANBAN
+    // ========================================================
+    renderLaundry(parent) {
+        const board = this.createEl('div', { cls: 'w-kanban', parent });
+        const cols = ['clean', 'hamper', 'laundry', 'repair', 'donate'];
+        
+        cols.forEach(status => {
+            const col = this.createEl('div', { cls: 'w-col', parent: board });
+            const head = this.createEl('div', { cls: 'w-col-head', parent: col });
+            
+            // Filter items by status
+            const items = this.pages.filter(p => p[CONFIG.keys.status] === status);
+            head.innerHTML = `<span>${status.toUpperCase()}</span> <span style="opacity:0.5">${items.length}</span>`;
+
+            const body = this.createEl('div', { cls: 'w-col-body', parent: col });
+            
+            items.forEach(p => {
+                const card = this.createEl('div', { cls: 'w-k-card', parent: body });
+                
+                // Mini Card Content
+                const main = this.createEl('div', { cls: 'w-k-main', parent: card });
+                const imgUrl = p[CONFIG.keys.image] || "";
+                this.createEl('div', { cls: 'w-k-img', style: `background-image:url('${imgUrl}')`, parent: main });
+                const info = this.createEl('div', { parent: main });
+                this.createEl('div', { text: p.file.name, style: 'font-weight:bold; font-size:0.9rem', parent: info });
+                this.createEl('div', { text: p[CONFIG.keys.brand], style: 'font-size:0.75rem; color:#888;', parent: info });
+
+                // Actions (Move Arrows)
+                const actions = this.createEl('div', { cls: 'w-k-actions', parent: card });
+                
+                // Move Left
+                const leftBtn = this.createEl('button', { cls: 'w-k-btn', text: "←", parent: actions });
+                leftBtn.onclick = async () => {
+                    const prevStatus = cols[Math.max(0, cols.indexOf(status) - 1)];
+                    await this.updateStatus(p, prevStatus);
+                };
+
+                // Move Right
+                const rightBtn = this.createEl('button', { cls: 'w-k-btn', text: "→", parent: actions });
+                rightBtn.onclick = async () => {
+                    const nextStatus = cols[Math.min(cols.length - 1, cols.indexOf(status) + 1)];
+                    await this.updateStatus(p, nextStatus);
+                };
+            });
+        });
+    }
+
+    async updateStatus(page, newStatus) {
+        await app.fileManager.processFrontMatter(page.file, (fm) => {
+            fm[CONFIG.keys.status] = newStatus;
+        });
+        // Tiny delay to allow Obsidian cache to update before re-render
+        setTimeout(() => this.render(), 200);
+    }
+
+    // ========================================================
+    // VIEW 4: ANALYTICS
+    // ========================================================
+    renderStats(parent) {
+        const container = this.createEl('div', { style: 'padding:20px; max-width:1000px; margin:0 auto;', parent });
+        
+        // Calculations
+        const totalItems = this.pages.length;
+        const totalValue = this.pages.reduce((acc, p) => acc + (p[CONFIG.keys.cost] || 0), 0);
+        const activeItems = this.pages.filter(p => (p[CONFIG.keys.wearCount] || 0) > 0).length;
+        const efficiency = Math.round((activeItems / totalItems) * 100) || 0;
+        
+        // Hero Stats
+        const hero = this.createEl('div', { cls: 'w-stats-hero', parent: container });
+        this.renderStatBox(hero, totalItems, "Total Items");
+        this.renderStatBox(hero, `$${totalValue}`, "Total Value");
+        this.renderStatBox(hero, `${efficiency}%`, "Efficiency");
+        
+        // Find Most Worn
+        const sorted = [...this.pages].sort((a, b) => (b[CONFIG.keys.wearCount] || 0) - (a[CONFIG.keys.wearCount] || 0));
+        const mostWorn = sorted[0];
+        if(mostWorn) {
+            const cpw = Math.round((mostWorn[CONFIG.keys.cost] || 0) / (mostWorn[CONFIG.keys.wearCount] || 1));
+            this.renderStatBox(hero, `$${cpw}`, "Best CPW");
+        }
+
+        // Color Bar
+        this.createEl('h3', { text: "Color Palette Breakdown", style: 'margin-top:40px; border-bottom:1px solid #333; padding-bottom:10px;', parent: container });
+        const colorCounts = {};
+        this.pages.forEach(p => {
+            const c = p[CONFIG.keys.color];
+            if(Array.isArray(c)) c.forEach(x => colorCounts[x] = (colorCounts[x] || 0) + 1);
+            else if(c) colorCounts[c] = (colorCounts[c] || 0) + 1;
+        });
+        
+        const barWrap = this.createEl('div', { style: 'display:flex; height:30px; border-radius:15px; overflow:hidden; margin-top:15px;', parent: container });
+        Object.entries(colorCounts).sort((a,b) => b[1] - a[1]).forEach(([color, count]) => {
+            const width = (count / totalItems) * 100;
+            // Map common names to CSS colors roughly
+            let bg = color.toLowerCase();
+            if(bg === 'navy') bg = '#000080';
+            if(bg === 'denim') bg = '#1560bd';
+            if(bg === 'cream') bg = '#fffdd0';
+            
+            const seg = this.createEl('div', { 
+                style: `width:${width}%; background:${bg}; opacity:0.8;`, 
+                title: `${color}: ${count}`,
+                parent: barWrap 
+            });
+        });
+        
+        // Inventory List (Simple text list)
+        this.createEl('h3', { text: "Inventory by Category", style: 'margin-top:40px; border-bottom:1px solid #333; padding-bottom:10px;', parent: container });
+        const catCounts = {};
+        this.pages.forEach(p => {
+            const c = p[CONFIG.keys.category] || "Uncategorized";
+            catCounts[c] = (catCounts[c] || 0) + 1;
+        });
+        
+        const listGrid = this.createEl('div', { style: 'display:grid; grid-template-columns: 1fr 1fr; gap:20px;', parent: container });
+        Object.entries(catCounts).sort((a,b) => b[1] - a[1]).forEach(([cat, count]) => {
+            this.createEl('div', { 
+                innerHTML: `<b>${cat}</b>: ${count} items`, 
+                style: 'padding:10px; background:rgba(255,255,255,0.05); border-radius:8px;',
+                parent: listGrid 
+            });
+        });
+    }
+
+    renderStatBox(parent, num, label) {
+        const box = this.createEl('div', { cls: 'w-stat-box', parent });
+        this.createEl('div', { cls: 'w-stat-num', text: String(num), parent: box });
+        this.createEl('div', { cls: 'w-stat-lbl', text: label, parent: box });
+    }
+
+    // ========================================================
+    // HELPERS & MODALS
+    // ========================================================
+    
+    openItemModal(p) {
+        // Create Modal Overlay
+        const bg = this.createEl('div', { cls: 'w-modal-bg', parent: document.body });
+        
+        // Panel
+        const panel = this.createEl('div', { cls: 'w-modal-panel', parent: bg });
+        
+        // Close on click outside
+        bg.onclick = (e) => { if (e.target === bg) bg.remove(); };
+
+        // Left: Image
+        const left = this.createEl('div', { cls: 'w-modal-left', parent: panel });
+        const img = p[CONFIG.keys.image] || "";
+        this.createEl('div', { cls: 'w-modal-poster', style: `background-image:url('${img}')`, parent: left });
+
+        // Right: Details
+        const right = this.createEl('div', { cls: 'w-modal-right', parent: panel });
+        this.createEl('div', { cls: 'w-m-title', text: p.file.name, parent: right });
+        
+        // Metadata Table
+        const table = this.createEl('table', { style: 'width:100%; border-collapse:collapse; margin-bottom:20px;', parent: right });
+        const fields = [
+            ["Brand", p[CONFIG.keys.brand]],
+            ["Size", p[CONFIG.keys.size]],
+            ["Cost", `$${p[CONFIG.keys.cost] || 0}`],
+            ["Worn", `${p[CONFIG.keys.wearCount] || 0} times`],
+            ["Status", p[CONFIG.keys.status]],
+            ["Season", p[CONFIG.keys.season]]
+        ];
+        
+        fields.forEach(([k, v]) => {
+            const tr = this.createEl('tr', { style: 'border-bottom:1px solid #333;', parent: table });
+            this.createEl('td', { text: k, style: 'padding:8px; color:#888; width:100px;', parent: tr });
+            this.createEl('td', { text: String(v || '-'), style: 'padding:8px;', parent: tr });
+        });
+
+        // Edit Button (Opens actual file)
+        const btn = this.createEl('button', { cls: 'w-btn', text: "Edit File", parent: right });
+        btn.onclick = () => {
+            bg.remove();
+            app.workspace.openLinkText(p.file.path, "", false);
+        };
+    }
+
+    refreshGrid() {
+        const grid = this.container.querySelector('#closet-grid');
+        if (grid) this.populateGrid(grid);
+    }
+
+    createEl(tag, { cls, text, id, style, innerHTML, parent } = {}) {
+        const el = document.createElement(tag);
+        if (cls) el.className = cls;
+        if (id) el.id = id;
+        if (style) el.style = style;
+        if (text) el.innerText = text;
+        if (innerHTML) el.innerHTML = innerHTML;
+        if (parent) parent.appendChild(el);
+        return el;
+    }
+}
+
+// 3. EXECUTION -----------------------------------------------
+const appInstance = new WardrobeApp();
+await appInstance.init();
