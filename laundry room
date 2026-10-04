@@ -1,0 +1,381 @@
+// ╔══════════════════════════════════════════════════════════════╗
+//  👕  WARDROBE KANBAN  —  DataviewJS
+// ╚══════════════════════════════════════════════════════════════╝
+
+// ═══════════════════════════════════════════════════════════════
+//  ⚙️  CONFIGURATION
+// ═══════════════════════════════════════════════════════════════
+
+const CONFIG = {
+    itemsFolder: "Items",
+    keys: {
+        status:      "clothingstatus",
+        image:       "image",
+        brand:       "brand",
+        subcategory: "clothingsubcategory",
+        notes:       "notes",
+    },
+    // Card aspect ratio (height / width)
+    cardAspect: 1.3,
+    // Maximum rows of cards per column before expanding horizontally
+    maxRows: 3,
+    // Minimum card width in px — columns won't shrink cards below this
+    minCardWidth: 70,
+    // Gap between cards (px) — keep in sync with --wk-card-gap in CSS
+    cardGap: 8,
+    // Horizontal gap between columns (px) — keep in sync with --wk-group-columns-gap
+    colGap: 12,
+    // Padding inside each column body on each side (px)
+    colPad: 8,
+    groups: [
+        {
+            label:    "Active",
+            collapsed: false,
+            columns: [
+                { status: "clean",   label: "Clean"   },
+                { status: "hamper",  label: "Hamper"  },
+                { status: "laundry", label: "Laundry" },
+            ],
+        },
+        {
+            label:    "Sidelined",
+            collapsed: true,
+            columns: [
+                { status: "donate",  label: "Donate"  },
+                { status: "replace", label: "Replace" },
+                { status: "repair",  label: "Repair"  },
+            ],
+        },
+        {
+            label:    "Other",
+            collapsed: true,
+            columns: [
+                { status: "archive",  label: "Archive"  },
+                { status: "wishlist", label: "Wishlist" },
+            ],
+        },
+    ],
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  🛠  UTILITIES
+// ═══════════════════════════════════════════════════════════════
+
+function fk(p, alias) { return p[CONFIG.keys[alias]]; }
+function lc(v)        { return String(v || "").toLowerCase().trim(); }
+
+function resolveImage(imageProp) {
+    if (!imageProp) return null;
+    const s  = String(imageProp);
+    const wm = s.match(/!?\[\[(.+?)(?:\|[^\]]+)?\]\]/);
+    if (wm) {
+        const name = wm[1];
+        const f = app.vault.getFiles().find(
+            fi => fi.name === name || fi.path === name ||
+                  fi.path.endsWith("/" + name)
+        );
+        return f ? app.vault.getResourcePath(f) : null;
+    }
+    if (/^https?:\/\//.test(s)) return s;
+    const f2 = app.vault.getAbstractFileByPath(s);
+    return f2 ? app.vault.getResourcePath(f2) : null;
+}
+
+function displayName(p) {
+    return [fk(p, "brand"), fk(p, "subcategory")]
+        .filter(Boolean).map(s => String(s).trim()).join(" ")
+        || p.file.name.replace(/\.md$/, "");
+}
+
+function make(tag, cls = "") {
+    const el = document.createElement(tag);
+    if (cls) el.className = cls;
+    return el;
+}
+
+function showToast(msg, isError = false) {
+    const t = make("div", "wk-toast" + (isError ? " wk-toast--error" : ""));
+    t.textContent = msg;
+    ROOT.appendChild(t);
+    setTimeout(() => t.classList.add("wk-toast--out"), 2200);
+    setTimeout(() => t.remove(), 2600);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  📦  STATE
+// ═══════════════════════════════════════════════════════════════
+
+const allPages = dv.pages(`"${CONFIG.itemsFolder}"`).array();
+
+const statusMap = {};
+allPages.forEach(p => { statusMap[p.file.path] = lc(fk(p, "status")); });
+
+const collapsed = {};
+CONFIG.groups.forEach(g => { collapsed[g.label] = g.collapsed; });
+
+// filePath → card DOM element (for optimistic moves)
+const cardElMap = {};
+// status → { bodyEl, colEl, countEl } (for sizer + drop + badge updates)
+const colMap = {};
+// group label → { groupEl, countEl, columnsWrap } (for collapse + sizer)
+const groupMap = {};
+
+// ═══════════════════════════════════════════════════════════════
+//  📐  COLUMN SIZER
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * For each visible group, divide the root width equally among its columns.
+ * Within each column, cards tile in rows of up to CONFIG.maxRows.
+ * Card width fills the column; height is derived from cardAspect.
+ * Sets --wk-card-w and --wk-card-h on each column element so both
+ * the grid template and the card elements stay in sync.
+ */
+function sizeColumns() {
+    const rootW = ROOT.offsetWidth || 600;
+
+    CONFIG.groups.forEach(group => {
+        if (collapsed[group.label]) return;
+        const gm      = groupMap[group.label];
+        if (!gm) return;
+
+        const numCols = group.columns.length;
+        // Total width available for cards = root minus gaps between columns
+        const totalGaps = CONFIG.colGap * (numCols - 1);
+        const colW      = (rootW - totalGaps) / numCols;
+
+        group.columns.forEach(col => {
+            const cm = colMap[col.status];
+            if (!cm) return;
+
+            const cardCount   = cm.bodyEl.children.length;
+            // How many columns of cards needed to fit all within maxRows
+            const numCardCols = Math.max(1, Math.ceil(cardCount / CONFIG.maxRows));
+            // Card width = column width minus body padding and card gaps
+            const innerW      = colW - CONFIG.colPad * 2;
+            const gapsInside  = CONFIG.cardGap * (numCardCols - 1);
+            const rawCardW    = (innerW - gapsInside) / numCardCols;
+            const cardW       = Math.max(CONFIG.minCardWidth, Math.floor(rawCardW));
+            const cardH       = Math.floor(cardW * CONFIG.cardAspect);
+
+            cm.colEl.style.setProperty("--wk-card-w", cardW + "px");
+            cm.colEl.style.setProperty("--wk-card-h", cardH + "px");
+        });
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ✍️  WRITE STATUS
+// ═══════════════════════════════════════════════════════════════
+
+async function setStatus(filePath, newStatus) {
+    const tfile = app.vault.getAbstractFileByPath(filePath);
+    if (!tfile) { showToast("Could not find file.", true); return false; }
+    try {
+        await app.fileManager.processFrontMatter(tfile, fm => {
+            fm[CONFIG.keys.status] = newStatus;
+        });
+        statusMap[filePath] = lc(newStatus);
+        return true;
+    } catch (e) {
+        showToast(`Could not update: ${e.message}`, true);
+        console.error("[Wardrobe Kanban] setStatus error:", e);
+        return false;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  🎨  BUILD CARD
+// ═══════════════════════════════════════════════════════════════
+
+function buildCard(page) {
+    const imgSrc = resolveImage(fk(page, "image"));
+    const name   = displayName(page);
+
+    const card       = make("div", "wk-card");
+    card.draggable   = true;
+    card.dataset.path = page.file.path;
+    card.title       = name;
+
+    const img = make("div", "wk-card__img");
+    if (imgSrc) {
+        img.style.backgroundImage = `url('${imgSrc}')`;
+    } else {
+        img.innerHTML = `<span class="wk-card__no-img">✦</span>`;
+    }
+    card.appendChild(img);
+
+    card.addEventListener("dragstart", e => {
+        e.dataTransfer.effectAllowed = "move";
+        e.dataTransfer.setData("text/plain", page.file.path);
+        setTimeout(() => card.classList.add("wk-card--dragging"), 0);
+    });
+    card.addEventListener("dragend", () => {
+        card.classList.remove("wk-card--dragging");
+    });
+
+    cardElMap[page.file.path] = card;
+    return card;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  🔢  COUNT BADGE UPDATES
+// ═══════════════════════════════════════════════════════════════
+
+function updateBadges(affectedStatuses) {
+    affectedStatuses.forEach(status => {
+        const cm = colMap[status];
+        if (cm) cm.countEl.textContent = String(cm.bodyEl.children.length);
+    });
+    // Update group totals
+    CONFIG.groups.forEach(group => {
+        const gm = groupMap[group.label];
+        if (!gm) return;
+        let total = 0;
+        group.columns.forEach(col => {
+            const cm = colMap[col.status];
+            if (cm) total += cm.bodyEl.children.length;
+        });
+        gm.countEl.textContent = String(total);
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  🏗  BUILD BOARD
+// ═══════════════════════════════════════════════════════════════
+
+function buildBoard() {
+    ROOT.innerHTML = "";
+    Object.keys(cardElMap).forEach(k => delete cardElMap[k]);
+    Object.keys(colMap).forEach(k => delete colMap[k]);
+    Object.keys(groupMap).forEach(k => delete groupMap[k]);
+
+    // ── Header ──────────────────────────────────────────────────
+    const header   = make("div", "wk-header");
+    const wordmark = make("span", "wk-header__wordmark");
+    wordmark.innerHTML = `<span class="wk-header__icon">✦</span> Laundry Room`;
+    header.appendChild(wordmark);
+    ROOT.appendChild(header);
+
+    // ── Groups ──────────────────────────────────────────────────
+    CONFIG.groups.forEach(group => {
+        const groupEl      = make("div", "wk-group");
+        const groupHead    = make("div", "wk-group__header");
+        const chevron      = make("span", "wk-group__chevron");
+        chevron.textContent = "›";
+        chevron.style.transform = collapsed[group.label] ? "rotate(0deg)" : "rotate(90deg)";
+
+        const labelEl  = make("span", "wk-group__label");
+        labelEl.textContent = group.label;
+
+        const countBadge = make("span", "wk-group__count");
+        const allStatuses = group.columns.map(c => c.status);
+        countBadge.textContent = String(
+            allPages.filter(p => allStatuses.includes(statusMap[p.file.path])).length
+        );
+
+        groupHead.appendChild(chevron);
+        groupHead.appendChild(labelEl);
+        groupHead.appendChild(countBadge);
+
+        const columnsWrap = make("div", "wk-group__columns");
+        if (collapsed[group.label]) groupEl.classList.add("wk-group--collapsed");
+
+        groupHead.addEventListener("click", () => {
+            collapsed[group.label] = !collapsed[group.label];
+            groupEl.classList.toggle("wk-group--collapsed", collapsed[group.label]);
+            chevron.style.transform = collapsed[group.label] ? "rotate(0deg)" : "rotate(90deg)";
+            // Recalculate sizes when a group is expanded
+            if (!collapsed[group.label]) sizeColumns();
+        });
+
+        groupEl.appendChild(groupHead);
+
+        // ── Columns ─────────────────────────────────────────────
+        group.columns.forEach(col => {
+            const colEl    = make("div", "wk-col");
+            const colHead  = make("div", "wk-col__header");
+            const colLabel = make("span", "wk-col__label");
+            colLabel.textContent = col.label;
+            const colCount = make("span", "wk-col__count");
+            const colItems = allPages.filter(p => statusMap[p.file.path] === col.status);
+            colCount.textContent = String(colItems.length);
+            colHead.appendChild(colLabel);
+            colHead.appendChild(colCount);
+            colEl.appendChild(colHead);
+
+            const body = make("div", "wk-col__body");
+            colItems.forEach(p => body.appendChild(buildCard(p)));
+            colEl.appendChild(body);
+
+            // Store references
+            colMap[col.status] = { bodyEl: body, colEl, countEl: colCount };
+
+            // ── Drop events ──
+            colEl.addEventListener("dragover", e => {
+                e.preventDefault();
+                e.dataTransfer.dropEffect = "move";
+                colEl.classList.add("wk-col--over");
+            });
+            colEl.addEventListener("dragleave", e => {
+                if (!colEl.contains(e.relatedTarget))
+                    colEl.classList.remove("wk-col--over");
+            });
+            colEl.addEventListener("drop", async e => {
+                e.preventDefault();
+                colEl.classList.remove("wk-col--over");
+
+                const filePath   = e.dataTransfer.getData("text/plain");
+                const prevStatus = statusMap[filePath];
+                if (!filePath || prevStatus === col.status) return;
+
+                // Optimistic move
+                const card = cardElMap[filePath];
+                if (card) body.appendChild(card);
+                updateBadges([prevStatus, col.status]);
+                sizeColumns();
+
+                const ok = await setStatus(filePath, col.status);
+                if (!ok) {
+                    // Revert
+                    const revertBody = colMap[prevStatus]?.bodyEl;
+                    if (card && revertBody) revertBody.appendChild(card);
+                    updateBadges([prevStatus, col.status]);
+                    sizeColumns();
+                }
+            });
+
+            columnsWrap.appendChild(colEl);
+        });
+
+        groupEl.appendChild(columnsWrap);
+        ROOT.appendChild(groupEl);
+
+        groupMap[group.label] = {
+            groupEl,
+            countEl:     countBadge,
+            columnsWrap,
+        };
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  🚀  BOOTSTRAP
+// ═══════════════════════════════════════════════════════════════
+
+const ROOT = dv.container;
+ROOT.className = "wk-root";
+
+buildBoard();
+
+// Size immediately after paint so offsetWidth is available
+requestAnimationFrame(() => {
+    sizeColumns();
+
+    // Re-size whenever the container changes width
+    const ro = new ResizeObserver(() => sizeColumns());
+    ro.observe(ROOT);
+
+    // Clean up observer when the DataviewJS block is removed
+    dv.container.addEventListener("unload", () => ro.disconnect(), { once: true });
+});
