@@ -1,0 +1,1127 @@
+```dataviewjs
+// ╔══════════════════════════════════════════════════════════════╗
+//  ✨  OUTFIT BUILDER  —  DataviewJS
+// ╚══════════════════════════════════════════════════════════════╝
+
+// ═══════════════════════════════════════════════════════════════
+//  ⚙️  CONFIGURATION
+// ═══════════════════════════════════════════════════════════════
+
+const CONFIG = {
+    itemsFolder:   "Items",
+    // Note where saved outfits + bridge data are stored (no .md)
+    savedNote:     "Saved Outfits",
+    // This note's own name — used to persist draft state across re-renders
+    builderNote:   "Outfit Builder",
+    keys: {
+        brand:       "brand",
+        style:       "clothingstyle",
+        subcategory: "clothingsubcategory",
+        category:    "clothingcategory",
+        status:      "clothingstatus",
+        image:       "image",
+        color:       "color",
+        styling_tags:"styling_tags",
+        size:        "size",
+        outfits:       "outfits",        // saved outfits array on Saved Outfits note
+        collections:   "collections",     // saved collections array on Saved Outfits note
+        pendingImport: "pendingImport",   // bridge key written by Wardrobe Stylist
+        draftItems:    "draftItems",      // in-progress item paths on this note
+        draftName:     "draftName",       // in-progress outfit name on this note
+    },
+    // Statuses excluded from search results
+    excludeStatuses: ["archive"],
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  🛠  UTILITIES
+// ═══════════════════════════════════════════════════════════════
+
+function fk(p, alias) { return p[CONFIG.keys[alias]]; }
+function lc(v) { return String(v || "").toLowerCase().trim(); }
+function asList(val) {
+    if (!val) return [];
+    if (Array.isArray(val)) return val.map(v => String(v).trim()).filter(Boolean);
+    return [String(val).trim()].filter(Boolean);
+}
+function toTitleCase(s) {
+    return String(s || "").replace(/\w\S*/g, w =>
+        w.charAt(0).toUpperCase() + w.slice(1).toLowerCase());
+}
+/** Generate a short random ID for stable outfit references */
+function makeId() {
+    return Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+}
+
+function cleanStyle(val) {
+    if (!val) return "";
+    const parts = Array.isArray(val) ? val : [val];
+    return parts.flatMap(s => String(s).split(","))
+        .map(s => s.trim()).filter(Boolean)
+        .map(p => p.split(/\s+/).map(toTitleCase).join(" "))
+        .join(" ");
+}
+function displayName(p) {
+    const brand  = fk(p, "brand")  ? String(fk(p, "brand")).trim() : "";
+    const style  = cleanStyle(fk(p, "style"));
+    const subcat = fk(p, "subcategory")
+        ? String(fk(p, "subcategory")).split(/\s+/).map(toTitleCase).join(" ") : "";
+    return [brand, style, subcat].filter(Boolean).join(" ")
+        || p.file.name.replace(/\.md$/, "");
+}
+function resolveImage(imageProp) {
+    if (!imageProp) return null;
+    const s  = String(imageProp);
+    const wm = s.match(/!?\[\[(.+?)(?:\|[^\]]+)?\]\]/);
+    if (wm) {
+        const name = wm[1];
+        const f = app.vault.getFiles().find(
+            fi => fi.name === name || fi.path === name || fi.path.endsWith("/" + name));
+        return f ? app.vault.getResourcePath(f) : null;
+    }
+    if (/^https?:\/\//.test(s)) return s;
+    const f2 = app.vault.getAbstractFileByPath(s);
+    return f2 ? app.vault.getResourcePath(f2) : null;
+}
+function make(tag, cls = "") {
+    const el = document.createElement(tag);
+    if (cls) el.className = cls;
+    return el;
+}
+
+/**
+ * Returns a debounced version of fn that only fires after `wait` ms
+ * of silence. Pass leading:true to also fire immediately on the first
+ * call (good for clicks — instant response, but ignores rapid repeats).
+ */
+function debounce(fn, wait = 300, { leading = false } = {}) {
+    let timer = null;
+    function debounced(...args) {
+        const callNow = leading && !timer;
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+            timer = null;
+            if (!leading) fn.apply(this, args);
+        }, wait);
+        if (callNow) fn.apply(this, args);
+    }
+    // flush(): cancel pending timer and fire immediately
+    debounced.flush = function(...args) {
+        clearTimeout(timer);
+        timer = null;
+        fn.apply(this, args);
+    };
+    return debounced;
+}
+
+// Pre-built debounced versions used throughout the UI.
+// Pills call render() directly — they're intentional single clicks,
+// debouncing them creates a delayed re-render that can stomp on the
+// name input or Save button while the user is mid-flow.
+// Only the search input and card clicks are debounced.
+const debouncedRenderResults = debounce(renderResults, 5000);  // search input typing
+function txt(tag, cls, content) {
+    const el = make(tag, cls);
+    el.textContent = content;
+    return el;
+}
+function showToast(msg, isError = false) {
+    const t = make("div", "wb-toast" + (isError ? " wb-toast--error" : ""));
+    t.textContent = msg;
+    ROOT.appendChild(t);
+    setTimeout(() => t.classList.add("wb-toast--out"), 2200);
+    setTimeout(() => t.remove(), 2600);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  📦  DATA
+// ═══════════════════════════════════════════════════════════════
+
+const allPages = dv.pages(`"${CONFIG.itemsFolder}"`).array()
+    .filter(p => !CONFIG.excludeStatuses.includes(lc(fk(p, "status"))));
+
+// Collect unique categories for filter pills
+const allCategories = [...new Set(
+    allPages.map(p => lc(fk(p, "category"))).filter(Boolean)
+)].sort();
+
+// Collect all vault-wide mood / occasion / season values for the tag picker
+function collectUnique(key) {
+    const s = new Set();
+    allPages.forEach(p => {
+        const val = p[key];
+        (Array.isArray(val) ? val : [val]).forEach(v => {
+            const t = String(v || "").trim();
+            if (t) s.add(toTitleCase(t));
+        });
+    });
+    return [...s].sort();
+}
+const ALL_MOODS     = collectUnique("mood");
+const ALL_OCCASIONS = collectUnique("occasion");
+const ALL_SEASONS   = collectUnique("season");
+
+// ── Persistence ──────────────────────────────────────────────
+
+function ensureFile() {
+    let file = app.metadataCache.getFirstLinkpathDest(CONFIG.savedNote, "");
+    if (file) return Promise.resolve(file);
+    return app.vault.create(CONFIG.savedNote + ".md",
+        "---\noutfits: []\ncollections: []\n---\n\n# Saved Outfits\n");
+}
+
+async function loadSavedOutfits() {
+    const page = dv.page(CONFIG.savedNote);
+    if (!page) return [];
+    const raw = asList(page[CONFIG.keys.outfits]);
+    return raw.map(entry => {
+        let o = entry;
+        if (typeof entry !== "object" || entry === null) {
+            try { o = JSON.parse(String(entry)); } catch { return null; }
+        }
+        // Migration: assign stable id if missing
+        if (o && !o.id) o.id = makeId();
+        return o;
+    }).filter(Boolean);
+}
+
+async function persistSavedOutfits(outfits) {
+    const file = await ensureFile();
+    await app.fileManager.processFrontMatter(file, fm => {
+        fm[CONFIG.keys.outfits] = outfits.map(o => JSON.stringify(o));
+    });
+}
+
+async function loadCollections() {
+    const page = dv.page(CONFIG.savedNote);
+    if (!page) return [];
+    const raw = asList(page[CONFIG.keys.collections]);
+    return raw.map(entry => {
+        if (typeof entry === "object" && entry !== null) return entry;
+        try { return JSON.parse(String(entry)); } catch { return null; }
+    }).filter(Boolean);
+}
+
+async function persistCollections(collections) {
+    const file = await ensureFile();
+    await app.fileManager.processFrontMatter(file, fm => {
+        fm[CONFIG.keys.collections] = collections.map(c => JSON.stringify(c));
+    });
+}
+
+/**
+ * Read the pendingImport payload left by the Stylist.
+ * Does NOT clear it — the user clears it manually via the banner.
+ * Returns [] if nothing is pending.
+ */
+async function loadPendingImport() {
+    const page = dv.page(CONFIG.savedNote);
+    if (!page) return [];
+    const raw = page[CONFIG.keys.pendingImport];
+    if (!raw || (Array.isArray(raw) && !raw.length)) return [];
+    return (Array.isArray(raw) ? raw : [raw]).map(String).filter(Boolean);
+}
+
+// ── Draft persistence ────────────────────────────────────────
+// Writes state.selected + state.outfitName to this note's own
+// frontmatter so the in-progress outfit survives DataviewJS
+// re-executions triggered by vault writes.
+
+async function saveDraft() {
+    const file = app.metadataCache.getFirstLinkpathDest(CONFIG.builderNote, "");
+    if (!file) return;
+    await app.fileManager.processFrontMatter(file, fm => {
+        fm[CONFIG.keys.draftItems] = state.selected;
+        fm[CONFIG.keys.draftName]  = state.outfitName;
+    });
+}
+
+async function loadDraft() {
+    const page = dv.page(CONFIG.builderNote);
+    if (!page) return;
+    const items = page[CONFIG.keys.draftItems];
+    const name  = page[CONFIG.keys.draftName];
+    if (items && Array.isArray(items) && items.length) {
+        const validPaths = new Set(allPages.map(p => p.file.path));
+        state.selected = items.filter(p => validPaths.has(String(p)));
+    }
+    if (name) state.outfitName = String(name);
+}
+
+async function clearDraft() {
+    const file = app.metadataCache.getFirstLinkpathDest(CONFIG.builderNote, "");
+    if (!file) return;
+    await app.fileManager.processFrontMatter(file, fm => {
+        fm[CONFIG.keys.draftItems] = [];
+        fm[CONFIG.keys.draftName]  = "";
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  📋  STATE
+// ═══════════════════════════════════════════════════════════════
+
+const state = {
+    query:          "",
+    filterCategory: "",   // "" = all
+    selected:       [],   // file paths of items in current outfit
+    outfitName:     "",
+    // Tags manually chosen for this outfit
+    selectedTags: { mood: [], occasion: [], season: [] },
+    // Index into savedOutfits when editing an existing outfit; null = new
+    editingIndex:   null,
+    savedOutfits:   [],   // loaded async on boot
+    savedQuery:     "",   // search string for the saved outfits section
+    collections:    [],   // loaded async on boot
+    collectionsQuery:        "",
+    expandedCollectionId:    null,   // which collection is open
+    pendingImport:  [],   // paths waiting to be loaded from Stylist
+};
+
+// Page lookup by path
+const pageByPath = {};
+allPages.forEach(p => { pageByPath[p.file.path] = p; });
+
+// ═══════════════════════════════════════════════════════════════
+//  🔍  SEARCH LOGIC
+// ═══════════════════════════════════════════════════════════════
+
+function getFilteredPages() {
+    const q = lc(state.query);
+    return allPages.filter(p => {
+        // Category filter
+        if (state.filterCategory &&
+            lc(fk(p, "category")) !== state.filterCategory) return false;
+        // Text search across name, brand, color, tags, subcategory, style
+        if (q) {
+            const haystack = [
+                displayName(p),
+                fk(p, "brand"),
+                fk(p, "subcategory"),
+                ...asList(fk(p, "color")),
+                ...asList(fk(p, "styling_tags")),
+            ].map(s => lc(String(s || ""))).join(" ");
+            if (!haystack.includes(q)) return false;
+        }
+        return true;
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  🏗  COMPONENT BUILDERS
+// ═══════════════════════════════════════════════════════════════
+
+// ── Tiny image card (search result) ─────────────────────────
+function buildSearchCard(page) {
+    const imgSrc  = resolveImage(fk(page, "image"));
+    const name    = displayName(page);
+    const isAdded = state.selected.includes(page.file.path);
+
+    const card = make("div", "wb-search-card" + (isAdded ? " wb-search-card--added" : ""));
+    card.title = name;
+
+    const img = make("div", "wb-search-card__img");
+    if (imgSrc) img.style.backgroundImage = `url('${imgSrc}')`;
+    else img.innerHTML = `<span class="wb-card__no-img">✦</span>`;
+    card.appendChild(img);
+
+    const label = txt("div", "wb-search-card__label", name);
+    card.appendChild(label);
+
+    if (isAdded) {
+        const check = txt("div", "wb-search-card__check", "✓");
+        card.appendChild(check);
+    }
+
+    // Leading debounce: fires immediately on first click, ignores rapid repeats.
+    // Prevents double-clicking a card from toggling it off straight away.
+    // 700ms window gives enough time to move from a card to Save without interference.
+    const handleCardClick = debounce(() => {
+        if (state.selected.includes(page.file.path)) {
+            state.selected = state.selected.filter(p => p !== page.file.path);
+        } else {
+            state.selected.push(page.file.path);
+        }
+        saveDraft();
+        render();
+    }, 5000, { leading: true });
+
+    card.addEventListener("click", handleCardClick);
+
+    return card;
+}
+
+// ── Canvas item card ─────────────────────────────────────────
+function buildCanvasCard(filePath) {
+    const page   = pageByPath[filePath];
+    if (!page) return null;
+    const imgSrc = resolveImage(fk(page, "image"));
+    const name   = displayName(page);
+
+    const wrap = make("div", "wb-canvas-item");
+
+    const card = make("div", "wb-canvas-card");
+    card.title = name;
+
+    const img = make("div", "wb-canvas-card__img");
+    if (imgSrc) img.style.backgroundImage = `url('${imgSrc}')`;
+    else img.innerHTML = `<span class="wb-card__no-img">✦</span>`;
+    card.appendChild(img);
+
+    // Remove button — appears on hover
+    const rmBtn = make("button", "wb-canvas-card__remove");
+    rmBtn.textContent = "×";
+    rmBtn.title = "Remove from outfit";
+    rmBtn.onclick = e => {
+        e.stopPropagation();
+        state.selected = state.selected.filter(p => p !== filePath);
+        saveDraft();
+        render();
+    };
+    card.appendChild(rmBtn);
+
+    wrap.appendChild(card);
+    wrap.appendChild(txt("div", "wb-canvas-item__label", name));
+    return wrap;
+}
+
+// ── Tag picker ──────────────────────────────────────────────
+/**
+ * Build the mood / occasion / season tag picker shown below the canvas row.
+ * Tags that appear on at least one item in the current outfit are marked
+ * "outfit-present" so they render distinctly from unrelated vault tags.
+ */
+function buildTagPicker() {
+    // Collect tags present on the outfit's items
+    const presentMoods     = new Set();
+    const presentOccasions = new Set();
+    const presentSeasons   = new Set();
+    state.selected.forEach(path => {
+        const p = pageByPath[path];
+        if (!p) return;
+        (Array.isArray(p.mood)     ? p.mood     : [p.mood])    .forEach(v => v && presentMoods.add(toTitleCase(String(v).trim())));
+        (Array.isArray(p.occasion) ? p.occasion : [p.occasion]).forEach(v => v && presentOccasions.add(toTitleCase(String(v).trim())));
+        (Array.isArray(p.season)   ? p.season   : [p.season])  .forEach(v => v && presentSeasons.add(toTitleCase(String(v).trim())));
+    });
+
+    const wrap = make("div", "wb-tag-picker");
+
+    function buildGroup(label, allVals, presentSet, selectedArr) {
+        if (!allVals.length) return;
+        const group = make("div", "wb-tag-group");
+        group.appendChild(txt("span", "wb-tag-group__label", label));
+        const pills = make("div", "wb-tag-pills");
+
+        allVals.forEach(val => {
+            const isPresent  = presentSet.has(val);
+            const isSelected = selectedArr.includes(val);
+            let cls = "wb-tag-pill";
+            if (isPresent)  cls += " wb-tag-pill--present";
+            if (isSelected) cls += " wb-tag-pill--on";
+            const pill = txt("button", cls, val);
+            pill.onclick = () => {
+                const idx = selectedArr.indexOf(val);
+                if (idx >= 0) selectedArr.splice(idx, 1);
+                else          selectedArr.push(val);
+                // Re-render only the tag picker area
+                const existing = ROOT.querySelector(".wb-tag-picker");
+                if (existing) existing.replaceWith(buildTagPicker());
+            };
+            pills.appendChild(pill);
+        });
+
+        group.appendChild(pills);
+        wrap.appendChild(group);
+    }
+
+    buildGroup("Mood",     ALL_MOODS,     presentMoods,     state.selectedTags.mood);
+    buildGroup("Occasion", ALL_OCCASIONS, presentOccasions, state.selectedTags.occasion);
+    buildGroup("Season",   ALL_SEASONS,   presentSeasons,   state.selectedTags.season);
+
+    return wrap;
+}
+
+// ── Saved outfit thumbnail ───────────────────────────────────
+function buildSavedCard(outfit, index) {
+    const card = make("div", "wb-saved-card");
+
+    // Thumbnail strip — up to 4 images
+    const thumbs = make("div", "wb-saved-card__thumbs");
+    outfit.items.slice(0, 4).forEach(path => {
+        const page = pageByPath[path];
+        const img  = make("div", "wb-saved-card__thumb");
+        if (page) {
+            const src = resolveImage(fk(page, "image"));
+            if (src) img.style.backgroundImage = `url('${src}')`;
+            else img.innerHTML = `<span class="wb-card__no-img" style="font-size:9px">✦</span>`;
+        }
+        thumbs.appendChild(img);
+    });
+    card.appendChild(thumbs);
+
+    const info = make("div", "wb-saved-card__info");
+
+    // Left: name + meta stacked
+    const infoLeft = make("div", "wb-saved-card__info-left");
+    infoLeft.appendChild(txt("div", "wb-saved-card__name", outfit.name || "Untitled"));
+    const meta = txt("div", "wb-saved-card__meta",
+        `${outfit.items.length} item${outfit.items.length !== 1 ? "s" : ""}  ·  ${outfit.date || ""}`);
+    infoLeft.appendChild(meta);
+    info.appendChild(infoLeft);
+
+    // Right: + and × as unobtrusive icon buttons always visible
+    const infoActions = make("div", "wb-saved-card__info-actions");
+
+    const addToColBtn = make("button", "wb-saved-icon-btn");
+    addToColBtn.textContent = "+";
+    addToColBtn.title = "Add to a collection";
+    addToColBtn.onclick = e => {
+        e.stopPropagation();
+        ROOT.querySelectorAll(".wb-col-menu").forEach(m => m.remove());
+        if (!state.collections.length) {
+            showToast("Create a collection first.");
+            return;
+        }
+        const menu = make("div", "wb-col-menu");
+        state.collections.forEach((col, ci) => {
+            const already = (col.outfitIds || []).includes(outfit.id);
+            const item = make("div", "wb-col-menu-item" + (already ? " wb-col-menu-item--in" : ""));
+            item.textContent = (already ? "✓  " : "") + col.name;
+            item.onclick = async ev => {
+                ev.stopPropagation();
+                menu.remove();
+                if (already) {
+                    state.collections[ci].outfitIds =
+                        (col.outfitIds || []).filter(id => id !== outfit.id);
+                    showToast(`Removed from "${col.name}".`);
+                } else {
+                    state.collections[ci].outfitIds = [...(col.outfitIds || []), outfit.id];
+                    showToast(`Added to "${col.name}".`);
+                }
+                await persistCollections(state.collections);
+                render();
+            };
+            menu.appendChild(item);
+        });
+        ROOT.style.position = "relative";
+        const btnRect  = addToColBtn.getBoundingClientRect();
+        const rootRect = ROOT.getBoundingClientRect();
+        menu.style.position = "absolute";
+        menu.style.top  = (btnRect.bottom - rootRect.top + 4) + "px";
+        menu.style.left = (btnRect.left   - rootRect.left)    + "px";
+        ROOT.appendChild(menu);
+        setTimeout(() => document.addEventListener("click", () => menu.remove(), { once: true }), 0);
+    };
+
+    const delBtn = make("button", "wb-saved-icon-btn wb-saved-icon-btn--del");
+    delBtn.textContent = "×";
+    delBtn.title = "Delete this outfit";
+    delBtn.onclick = async e => {
+        e.stopPropagation();
+        const deletedId = outfit.id;
+        state.savedOutfits.splice(index, 1);
+        // Remove this outfit's id from any collections it belonged to
+        state.collections.forEach(col => {
+            col.outfitIds = (col.outfitIds || []).filter(id => id !== deletedId);
+        });
+        await Promise.all([
+            persistSavedOutfits(state.savedOutfits),
+            persistCollections(state.collections),
+        ]);
+        showToast("Outfit deleted.");
+        render();
+    };
+
+    infoActions.appendChild(addToColBtn);
+    infoActions.appendChild(delBtn);
+    info.appendChild(infoActions);
+    card.appendChild(info);
+
+    // Tag chips
+    if (outfit.tags) {
+        const tagChips = make("div", "wb-saved-card__tags");
+        const allTagVals = [
+            ...(outfit.tags.mood     || []),
+            ...(outfit.tags.occasion || []),
+            ...(outfit.tags.season   || []),
+        ];
+        allTagVals.forEach(t => tagChips.appendChild(txt("span", "wb-saved-tag", t)));
+        if (allTagVals.length) card.appendChild(tagChips);
+    }
+
+    // Hover actions: Load + date/log only
+    const actions = make("div", "wb-saved-card__actions");
+
+    const loadBtn = make("button", "wb-btn--load");
+    loadBtn.textContent = "↩";
+    loadBtn.title = "Load into builder";
+    loadBtn.onclick = e => {
+        e.stopPropagation();
+        state.selected     = [...outfit.items];
+        state.outfitName   = outfit.name || "";
+        state.selectedTags = {
+            mood:     [...(outfit.tags?.mood     || [])],
+            occasion: [...(outfit.tags?.occasion || [])],
+            season:   [...(outfit.tags?.season   || [])],
+        };
+        state.editingIndex = index;
+        render();
+        ROOT.querySelector(".wb-canvas")?.scrollIntoView({ behavior: "smooth" });
+    };
+    actions.appendChild(loadBtn);
+
+    const savedLogWrap = make("div", "wb-log-wrap wb-log-wrap--saved");
+    const savedDateInput = make("input", "wb-date-input wb-date-input--saved");
+    savedDateInput.type  = "date";
+    savedDateInput.value = new Date().toLocaleDateString("en-CA");
+    savedDateInput.onclick = e => e.stopPropagation();
+    savedLogWrap.appendChild(savedDateInput);
+
+    const savedLogBtn = make("button", "wb-btn--log-saved");
+    savedLogBtn.textContent = "Log";
+    savedLogBtn.onclick = async e => {
+        e.stopPropagation();
+        const date = savedDateInput.value || new Date().toLocaleDateString("en-CA");
+        await logOutfit(date, outfit.items);
+    };
+    savedLogWrap.appendChild(savedLogBtn);
+    actions.appendChild(savedLogWrap);
+
+    card.appendChild(actions);
+
+    return card;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  📁  COLLECTIONS
+// ═══════════════════════════════════════════════════════════════
+
+function buildCollectionCard(col, colIndex) {
+    const isExpanded = state.expandedCollectionId === col.id;
+    // Resolve outfit objects in this collection
+    const colOutfits = (col.outfitIds || [])
+        .map(id => state.savedOutfits.find(o => o.id === id))
+        .filter(Boolean);
+
+    const card = make("div", "wb-col-card" + (isExpanded ? " wb-col-card--open" : ""));
+
+    // ── Header ──────────────────────────────────────────────────
+    const header = make("div", "wb-col-card__header");
+
+    const chevron = make("span", "wb-col-card__chevron");
+    chevron.textContent = "›";
+
+    // Editable name
+    const nameEl = make("div", "wb-col-card__name");
+    nameEl.textContent = col.name || "Untitled Collection";
+    nameEl.contentEditable = "true";
+    nameEl.spellcheck = false;
+
+    // Debounced persist — write fires 600ms after the last keystroke settles,
+    // not on every character. State is updated synchronously so any render()
+    // triggered by a simultaneous header click sees the new name immediately.
+    const debouncedPersistName = debounce(async () => {
+        await persistCollections(state.collections);
+    }, 600);
+
+    nameEl.addEventListener("click", e => e.stopPropagation());
+    nameEl.addEventListener("input", () => {
+        const newName = nameEl.textContent.trim();
+        if (newName) {
+            // Sync state update: render() called anywhere after this sees new name
+            state.collections[colIndex].name = newName;
+            debouncedPersistName();
+        }
+    });
+    nameEl.addEventListener("keydown", e => {
+        if (e.key === "Enter") { e.preventDefault(); nameEl.blur(); }
+        if (e.key === "Escape") { nameEl.textContent = col.name; nameEl.blur(); }
+    });
+    // On blur: flush any pending debounced write immediately
+    nameEl.addEventListener("blur", () => {
+        const newName = nameEl.textContent.trim();
+        if (!newName) {
+            // Restore if cleared
+            nameEl.textContent = col.name;
+            return;
+        }
+        if (newName !== col.name) {
+            state.collections[colIndex].name = newName;
+        }
+        // Flush — cancel debounce timer and write now
+        debouncedPersistName.flush?.();
+        persistCollections(state.collections);
+    });
+
+    const meta = txt("span", "wb-col-card__meta",
+        `${colOutfits.length} outfit${colOutfits.length !== 1 ? "s" : ""}`);
+
+    const delBtn = make("button", "wb-btn wb-col-card__delete");
+    delBtn.textContent = "×";
+    delBtn.title = "Delete collection (outfits are kept)";
+    delBtn.onclick = async e => {
+        e.stopPropagation();
+        state.collections.splice(colIndex, 1);
+        if (state.expandedCollectionId === col.id) state.expandedCollectionId = null;
+        await persistCollections(state.collections);
+        render();
+    };
+
+    header.appendChild(chevron);
+    header.appendChild(nameEl);
+    header.appendChild(meta);
+    header.appendChild(delBtn);
+
+    header.addEventListener("click", () => {
+        state.expandedCollectionId = isExpanded ? null : col.id;
+        render();
+    });
+
+    card.appendChild(header);
+
+    // ── Expanded content ─────────────────────────────────────────
+    if (isExpanded) {
+        const body = make("div", "wb-col-card__body");
+        if (!colOutfits.length) {
+            body.appendChild(txt("p", "wb-hint",
+                "No outfits in this collection yet. Use the + button on a saved outfit to add it."));
+        } else {
+            const grid = make("div", "wb-saved-grid wb-col-card__grid");
+            colOutfits.forEach(outfit => {
+                const outfitIdx = state.savedOutfits.findIndex(o => o.id === outfit.id);
+                grid.appendChild(buildSavedCard(outfit, outfitIdx));
+            });
+            body.appendChild(grid);
+        }
+        card.appendChild(body);
+    }
+
+    return card;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  🔍  SAVED OUTFIT SEARCH
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Filter saved outfits by state.savedQuery.
+ * Searches across: outfit name, mood/occasion/season tags, and for
+ * each item in the outfit: display name, brand, color, category,
+ * subcategory, and styling tags.
+ */
+function getFilteredOutfits() {
+    const q = lc(state.savedQuery);
+    if (!q) return state.savedOutfits.map((o, i) => ({ outfit: o, index: i }));
+
+    return state.savedOutfits
+        .map((outfit, index) => ({ outfit, index }))
+        .filter(({ outfit }) => {
+            // Outfit-level fields: name + tags
+            const outfitText = [
+                outfit.name || "",
+                ...(outfit.tags?.mood     || []),
+                ...(outfit.tags?.occasion || []),
+                ...(outfit.tags?.season   || []),
+            ].map(lc).join(" ");
+            if (outfitText.includes(q)) return true;
+
+            // Item-level fields: search across every item in the outfit
+            return (outfit.items || []).some(path => {
+                const page = pageByPath[path];
+                if (!page) return false;
+                const itemText = [
+                    displayName(page),
+                    fk(page, "brand"),
+                    fk(page, "category"),
+                    fk(page, "subcategory"),
+                    ...asList(fk(page, "color")),
+                    ...asList(fk(page, "styling_tags")),
+                ].map(s => lc(String(s || ""))).join(" ");
+                return itemText.includes(q);
+            });
+        });
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  🖼  RENDER
+// ═══════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════
+//  📋  LOG OUTFIT
+// ═══════════════════════════════════════════════════════════════
+
+async function logOutfit(date, paths) {
+    if (!paths.length) return;
+    const pages = paths.map(p => pageByPath[p]).filter(Boolean);
+    let updated = 0;
+    try {
+        for (const page of pages) {
+            const tfile = app.vault.getAbstractFileByPath(page.file.path);
+            if (!tfile) continue;
+            const others = pages
+                .filter(p => p.file.path !== page.file.path)
+                .map(p => `[[${p.file.name.replace(/\.md$/, "")}]]`)
+                .join(", ");
+            await app.fileManager.processFrontMatter(tfile, fm => {
+                const wearKey = "wear_count";
+                fm[wearKey] = (parseInt(fm[wearKey]) || 0) + 1;
+                if (!fm.outfits)                   fm.outfits = [];
+                if (!Array.isArray(fm.outfits))    fm.outfits = [fm.outfits];
+                fm.outfits.push(`${date}: Worn with ${others}`);
+            });
+            updated++;
+        }
+        showToast(`Logged for ${date} — ${updated} item${updated !== 1 ? "s" : ""} updated.`);
+    } catch (e) {
+        showToast(`Could not log: ${e.message}`, true);
+        console.error("[Outfit Builder] logOutfit error:", e);
+    }
+}
+
+function render() {
+    ROOT.innerHTML = "";
+
+    // ── Header ────────────────────────────────────────────────
+    const header = make("div", "wb-header");
+    header.innerHTML = `<span class="wb-header__icon">✦</span> Outfit Builder`;
+    ROOT.appendChild(header);
+
+    // ── Main layout: search | canvas ──────────────────────────
+    const main = make("div", "wb-main");
+
+    // ════ LEFT: Search panel ════
+    const searchPanel = make("div", "wb-search-panel");
+
+    // Search input
+    const searchWrap = make("div", "wb-search-wrap");
+    const searchInput = make("input", "wb-search-input");
+    searchInput.type        = "text";
+    searchInput.placeholder = "Search items…";
+    searchInput.value       = state.query;
+    searchInput.oninput     = () => { state.query = searchInput.value; debouncedRenderResults(resultsGrid); };
+    searchWrap.appendChild(searchInput);
+    searchPanel.appendChild(searchWrap);
+
+    // Category pills
+    const pills = make("div", "wb-pills");
+    const allPill = make("button", "wb-pill" + (!state.filterCategory ? " wb-pill--on" : ""));
+    allPill.textContent = "All";
+    allPill.onclick = () => { state.filterCategory = ""; render(); };
+    pills.appendChild(allPill);
+
+    allCategories.forEach(cat => {
+        const pill = make("button", "wb-pill" + (state.filterCategory === cat ? " wb-pill--on" : ""));
+        pill.textContent = toTitleCase(cat);
+        pill.onclick = () => { state.filterCategory = cat; render(); };
+        pills.appendChild(pill);
+    });
+    searchPanel.appendChild(pills);
+
+    // Results count
+    const filtered = getFilteredPages();
+    const countEl  = txt("div", "wb-results-count",
+        `${filtered.length} item${filtered.length !== 1 ? "s" : ""}` +
+        (state.selected.length ? `  ·  ${state.selected.length} selected` : ""));
+    searchPanel.appendChild(countEl);
+
+    // Results grid
+    const resultsGrid = make("div", "wb-results");
+    filtered.forEach(p => resultsGrid.appendChild(buildSearchCard(p)));
+    searchPanel.appendChild(resultsGrid);
+
+    main.appendChild(searchPanel);
+
+    // ════ RIGHT: Canvas ════
+    const canvasPanel = make("div", "wb-canvas");
+
+    // ── Stylist import banner — shown when Stylist has sent items ──
+    if (state.pendingImport.length) {
+        const banner = make("div", "wb-import-banner");
+        const bannerTxt = txt("span", "wb-import-banner__text",
+            `Stylist sent ${state.pendingImport.length} item${state.pendingImport.length !== 1 ? "s" : ""}`);
+        const loadImportBtn = make("button", "wb-btn wb-btn--import");
+        loadImportBtn.textContent = "Load into canvas";
+        loadImportBtn.onclick = () => {
+            state.selected     = [...state.pendingImport];
+            state.pendingImport = [];
+            saveDraft();
+            render();
+        };
+        const dismissBtn = make("button", "wb-btn wb-btn--dismiss");
+        dismissBtn.textContent = "Dismiss";
+        dismissBtn.onclick = async () => {
+            state.pendingImport = [];
+            // Clear from frontmatter too
+            const file = app.metadataCache.getFirstLinkpathDest(CONFIG.savedNote, "");
+            if (file) await app.fileManager.processFrontMatter(file,
+                fm => { fm[CONFIG.keys.pendingImport] = []; });
+            render();
+        };
+        banner.appendChild(bannerTxt);
+        banner.appendChild(loadImportBtn);
+        banner.appendChild(dismissBtn);
+        canvasPanel.appendChild(banner);
+    }
+
+    // Outfit name input + actions row
+    const outfitHeader = make("div", "wb-outfit-header");
+    const nameInput = make("input", "wb-outfit-name");
+    nameInput.type        = "text";
+    nameInput.placeholder = "Outfit name…";
+    nameInput.value       = state.outfitName;
+    nameInput.oninput     = () => { state.outfitName = nameInput.value; saveDraft(); };
+    outfitHeader.appendChild(nameInput);
+
+    const hasItems = state.selected.length > 0;
+
+    const isEditing = state.editingIndex !== null;
+    const saveBtn = make("button", "wb-btn wb-btn--save");
+    saveBtn.textContent = isEditing ? "Update" : "Save";
+    saveBtn.disabled = !hasItems;
+    saveBtn.onclick  = async () => {
+        const name = state.outfitName.trim() || "Untitled Outfit";
+        const date = new Date().toLocaleDateString("en-CA");
+        const existingId = isEditing
+            ? (state.savedOutfits[state.editingIndex]?.id || makeId())
+            : makeId();
+        const outfit = {
+            id:    existingId,
+            name,
+            date,
+            items: [...state.selected],
+            tags: {
+                mood:     [...state.selectedTags.mood],
+                occasion: [...state.selectedTags.occasion],
+                season:   [...state.selectedTags.season],
+            },
+        };
+        if (isEditing) {
+            state.savedOutfits[state.editingIndex] = outfit;
+            showToast(`"${name}" updated.`);
+        } else {
+            state.savedOutfits.push(outfit);
+            showToast(`"${name}" saved.`);
+        }
+        await persistSavedOutfits(state.savedOutfits);
+        state.outfitName   = "";
+        state.selected     = [];
+        state.selectedTags = { mood: [], occasion: [], season: [] };
+        state.editingIndex = null;
+        await clearDraft();
+        render();
+    };
+    outfitHeader.appendChild(saveBtn);
+
+    // ── Log button + date picker ──────────────────────────────
+    const logWrap = make("div", "wb-log-wrap");
+
+    const dateInput = make("input", "wb-date-input");
+    dateInput.type  = "date";
+    dateInput.value = new Date().toLocaleDateString("en-CA"); // default today
+    dateInput.disabled = !hasItems;
+    logWrap.appendChild(dateInput);
+
+    const logBtn = make("button", "wb-btn wb-btn--log");
+    logBtn.textContent = "Log";
+    logBtn.disabled = !hasItems;
+    logBtn.onclick  = async () => {
+        const date = dateInput.value || new Date().toLocaleDateString("en-CA");
+        await logOutfit(date, state.selected);
+    };
+    logWrap.appendChild(logBtn);
+    outfitHeader.appendChild(logWrap);
+
+    const clearBtn = make("button", "wb-btn wb-btn--clear");
+    clearBtn.textContent = "Clear";
+    clearBtn.disabled = !hasItems;
+    clearBtn.onclick  = () => {
+        state.selected     = [];
+        state.outfitName   = "";
+        state.selectedTags = { mood: [], occasion: [], season: [] };
+        state.editingIndex = null;
+        clearDraft();
+        render();
+    };
+    outfitHeader.appendChild(clearBtn);
+    canvasPanel.appendChild(outfitHeader);
+
+    // Canvas items grouped by category
+    if (state.selected.length === 0) {
+        const hint = txt("p", "wb-hint",
+            "Click items on the left to add them to your outfit.");
+        canvasPanel.appendChild(hint);
+    } else {
+        // Single flat row — all items side by side regardless of category
+        const row = make("div", "wb-canvas-row");
+        state.selected.forEach(path => {
+            const card = buildCanvasCard(path);
+            if (card) row.appendChild(card);
+        });
+        canvasPanel.appendChild(row);
+    }
+
+    // Tag picker — always visible so tags can be set before items are added
+    canvasPanel.appendChild(buildTagPicker());
+
+    main.appendChild(canvasPanel);
+    ROOT.appendChild(main);
+
+    // ── Collections ───────────────────────────────────────────
+    {
+        const colSection = make("div", "wb-col-section");
+
+        // Header: title + "New Collection" button + search
+        const colHeader = make("div", "wb-saved-header");
+        colHeader.appendChild(txt("div", "wb-saved-section__title", "Collections"));
+
+        const colSearch = make("input", "wb-saved-search");
+        colSearch.type        = "text";
+        colSearch.placeholder = "Search collections…";
+        colSearch.value       = state.collectionsQuery;
+        colSearch.oninput     = () => {
+            state.collectionsQuery = colSearch.value;
+            renderCollectionsList(colsList);
+        };
+        colHeader.appendChild(colSearch);
+
+        const newColBtn = make("button", "wb-btn wb-btn--newcol");
+        newColBtn.textContent = "+ New";
+        newColBtn.onclick = async () => {
+            const name = "Collection " + (state.collections.length + 1);
+            const col  = { id: makeId(), name, outfitIds: [] };
+            state.collections.push(col);
+            state.expandedCollectionId = col.id;
+            await persistCollections(state.collections);
+            render();
+        };
+        colHeader.appendChild(newColBtn);
+
+        colSection.appendChild(colHeader);
+
+        const colsList = make("div", "wb-cols-list");
+        renderCollectionsList(colsList);
+        colSection.appendChild(colsList);
+
+        ROOT.appendChild(colSection);
+    }
+
+    // ── Saved Outfits ─────────────────────────────────────────
+    if (state.savedOutfits.length > 0) {
+        const savedSection = make("div", "wb-saved-section");
+
+        // Header row: title + search input
+        const savedHeader = make("div", "wb-saved-header");
+        savedHeader.appendChild(txt("div", "wb-saved-section__title", "Saved Outfits"));
+
+        const savedSearchInput = make("input", "wb-saved-search");
+        savedSearchInput.type        = "text";
+        savedSearchInput.placeholder = "Search by name, item, color, mood…";
+        savedSearchInput.value       = state.savedQuery;
+        savedSearchInput.oninput     = () => {
+            state.savedQuery = savedSearchInput.value;
+            renderSavedGrid(savedGrid);
+            // Update count badge without full re-render
+            const badge = savedSection.querySelector(".wb-saved-count");
+            if (badge) {
+                const n = getFilteredOutfits().length;
+                badge.textContent = n + " / " + state.savedOutfits.length;
+            }
+        };
+        savedHeader.appendChild(savedSearchInput);
+
+        // Count badge showing filtered / total
+        const countBadge = make("span", "wb-saved-count");
+        const initialFiltered = getFilteredOutfits().length;
+        countBadge.textContent = state.savedQuery
+            ? initialFiltered + " / " + state.savedOutfits.length
+            : String(state.savedOutfits.length);
+        savedHeader.appendChild(countBadge);
+
+        savedSection.appendChild(savedHeader);
+
+        // Grid — rendered by helper so it can refresh without full re-render
+        const savedGrid = make("div", "wb-saved-grid");
+        renderSavedGrid(savedGrid);
+        savedSection.appendChild(savedGrid);
+
+        ROOT.appendChild(savedSection);
+    }
+}
+
+// Re-render only the collections list
+function renderCollectionsList(list) {
+    list.innerHTML = "";
+    const q = lc(state.collectionsQuery);
+    const visible = state.collections.filter(col => {
+        if (!q) return true;
+        // Match collection name or any outfit name inside it
+        if (lc(col.name).includes(q)) return true;
+        return (col.outfitIds || []).some(id => {
+            const o = state.savedOutfits.find(o => o.id === id);
+            return o && lc(o.name).includes(q);
+        });
+    });
+    if (!visible.length) {
+        list.appendChild(txt("p", "wb-hint",
+            state.collectionsQuery ? "No collections match." : "No collections yet."));
+        return;
+    }
+    visible.forEach(col => {
+        const ci = state.collections.findIndex(c => c.id === col.id);
+        list.appendChild(buildCollectionCard(col, ci));
+    });
+}
+
+// Re-render only the saved outfits grid (called on saved search input)
+function renderSavedGrid(grid) {
+    grid.innerHTML = "";
+    const results = getFilteredOutfits();
+    if (!results.length) {
+        const empty = txt("p", "wb-hint", state.savedQuery
+            ? "No saved outfits match your search."
+            : "No saved outfits yet.");
+        grid.appendChild(empty);
+        return;
+    }
+    results.forEach(({ outfit, index }) => {
+        grid.appendChild(buildSavedCard(outfit, index));
+    });
+}
+
+// Re-render only the results grid (called on search input to avoid losing focus)
+function renderResults(grid) {
+    grid.innerHTML = "";
+    getFilteredPages().forEach(p => grid.appendChild(buildSearchCard(p)));
+    // Update count
+    const countEl = ROOT.querySelector(".wb-results-count");
+    if (countEl) {
+        const filtered = getFilteredPages();
+        countEl.textContent =
+            `${filtered.length} item${filtered.length !== 1 ? "s" : ""}` +
+            (state.selected.length ? `  ·  ${state.selected.length} selected` : "");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  🚀  BOOTSTRAP
+// ═══════════════════════════════════════════════════════════════
+
+const ROOT = dv.container;
+ROOT.className = "wb-root";
+
+// Load saved data before first render
+state.savedOutfits = await loadSavedOutfits();
+state.collections  = await loadCollections();
+
+// Restore in-progress draft (survives DataviewJS re-executions)
+await loadDraft();
+
+// Check for a pending Stylist import (user loads it manually via banner)
+const pendingRaw = await loadPendingImport();
+if (pendingRaw.length) {
+    const validPaths = new Set(allPages.map(p => p.file.path));
+    state.pendingImport = pendingRaw.filter(p => validPaths.has(p));
+}
+
+render();
+```
